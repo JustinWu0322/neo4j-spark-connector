@@ -197,6 +197,7 @@ object Neo4jDataFrame {
     dataFrame.repartition(partitions).foreachPartition(rows => {
       val params: AnyRef = rows.map(r =>
         Map(
+          "source" -> Map(nodeLabel -> r.getAs[AnyRef](nodeLabel)).asJava,
           "node_properties" -> nodes._2.map(c => (renamedColumns.getOrElse(c, c), r.getAs[AnyRef](c))).toMap.asJava)
           .asJava).asJava
       Neo4jDataFrame.execute(config, createStatement, Map("rows" -> params).asJava, write = true)
