@@ -1,5 +1,7 @@
 package org.neo4j.spark
 
+import java.time.{Duration, LocalDateTime}
+
 import org.apache.spark._
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, Row, SQLContext}
@@ -10,63 +12,204 @@ import org.neo4j.driver.v1.summary.ResultSummary
 import org.neo4j.driver.v1.types.{Type, TypeSystem}
 
 import scala.collection.JavaConverters._
+import scala.collection.mutable.ArrayBuffer
 
 object Neo4jDataFrame {
 
-    def mergeEdgeList(sc: SparkContext,
-                      dataFrame: DataFrame,
-                      source: (String,Seq[String]),
-                      relationship: (String,Seq[String]),
-                      target: (String,Seq[String]),
-                      renamedColumns: Map[String,String] = Map.empty): Unit = {
+  def mergeEdgeList(sc: SparkContext,
+                    dataFrame: DataFrame,
+                    source: (String, Seq[String]),
+                    relationship: (String, Seq[String]),
+                    target: (String, Seq[String]),
+                    renamedColumns: Map[String, String] = Map.empty, batchSize: Int = 1000): Unit = {
 
-      val sourceLabel: String = renamedColumns.getOrElse(source._2.head, source._2.head)
-      val targetLabel: String = renamedColumns.getOrElse(target._2.head, target._2.head)
-      val mergeStatement = s"""
+    val sourceLabel: String = renamedColumns.getOrElse(source._2.head, source._2.head)
+    val targetLabel: String = renamedColumns.getOrElse(target._2.head, target._2.head)
+    val mergeStatement =
+      s"""
         UNWIND {rows} as row
         MERGE (source:`${source._1}` {`${sourceLabel}` : row.source.`${sourceLabel}`}) ON CREATE SET source += row.source
         MERGE (target:`${target._1}` {`${targetLabel}` : row.target.`${targetLabel}`}) ON CREATE SET target += row.target
         MERGE (source)-[rel:`${relationship._1}`]->(target) ON CREATE SET rel += row.relationship
         """
-      val partitions = Math.max(1,(dataFrame.count() / 10000).asInstanceOf[Int])
-      val config = Neo4jConfig(sc.getConf)
-      dataFrame.repartition(partitions).foreachPartition( rows => {
-        val params: AnyRef = rows.map(r =>
-          Map(
-            "source" -> source._2.map( c => (renamedColumns.getOrElse(c,c), r.getAs[AnyRef](c))).toMap.asJava,
-            "target" -> target._2.map( c => (renamedColumns.getOrElse(c,c), r.getAs[AnyRef](c))).toMap.asJava,
-            "relationship" -> relationship._2.map( c => (c, r.getAs[AnyRef](c))).toMap.asJava)
-            .asJava).asJava
-        execute(config, mergeStatement, Map("rows" -> params).asJava, write = true)
-      })
+    val partitions = Math.max(1, (dataFrame.count() / batchSize).asInstanceOf[Int])
+    val config = Neo4jConfig(sc.getConf)
+    dataFrame.repartition(partitions).foreachPartition(rows => {
+      val params: AnyRef = rows.map(r =>
+        Map(
+          "source" -> source._2.map(c => (renamedColumns.getOrElse(c, c), r.getAs[AnyRef](c))).toMap.asJava,
+          "target" -> target._2.map(c => (renamedColumns.getOrElse(c, c), r.getAs[AnyRef](c))).toMap.asJava,
+          "relationship" -> relationship._2.map(c => (c, r.getAs[AnyRef](c))).toMap.asJava)
+          .asJava).asJava
+      execute(config, mergeStatement, Map("rows" -> params).asJava, write = true)
+    })
   }
 
 
-  def createNodes(sc: SparkContext, dataFrame: DataFrame, nodes: (String,Seq[String]), renamedColumns: Map[String,String] = Map.empty): Unit = {
+  def createEdgeList(sc: SparkContext,
+                     dataFrame: DataFrame,
+                     source: (String, Seq[String]),
+                     relationship: (String, Seq[String]),
+                     target: (String, Seq[String]),
+                     renamedColumns: Map[String, String] = Map.empty, batchSize: Int = 1000): Unit = {
 
-    val nodeLabel: String = renamedColumns.getOrElse(nodes._2.head, nodes._2.head)
-    val createStatement = s"""
+    val sourceLabel: String = renamedColumns.getOrElse(source._2.head, source._2.head)
+    val targetLabel: String = renamedColumns.getOrElse(target._2.head, target._2.head)
+    val mergeStatement =
+      s"""
         UNWIND {rows} as row
-        CREATE (node:`${nodes._1}` {`${nodeLabel}` : row.source.`${nodeLabel}`})
-        SET node = row.node_properties
+        MATCH (source:`${source._1}` {`${sourceLabel}` : row.source.`${sourceLabel}`}),
+        (target:`${target._1}` {`${targetLabel}` : row.target.`${targetLabel}`})
+        create (source)-[rel:`${relationship._1}`]->(target) return count(rel)
         """
-    val partitions = Math.max(1,(dataFrame.count() / 10000).asInstanceOf[Int])
-    val config = Neo4jConfig( sc.getConf )
-    dataFrame.repartition(partitions).foreachPartition( rows => {
+
+    println(s"=============mergeStatement: ${mergeStatement}")
+    val partitions = Math.max(1, (dataFrame.count() / batchSize).asInstanceOf[Int])
+    val config = Neo4jConfig(sc.getConf)
+    dataFrame.repartition(partitions).foreachPartition(rows => {
       val params: AnyRef = rows.map(r =>
         Map(
-          "node_properties" -> nodes._2.map( c => (renamedColumns.getOrElse(c,c), r.getAs[AnyRef](c))).toMap.asJava)
+          "source" -> source._2.map(c => (renamedColumns.getOrElse(c, c), r.getAs[AnyRef](c))).toMap.asJava,
+          "target" -> target._2.map(c => (renamedColumns.getOrElse(c, c), r.getAs[AnyRef](c))).toMap.asJava,
+          "relationship" -> relationship._2.map(c => (c, r.getAs[AnyRef](c))).toMap.asJava)
+          .asJava).asJava
+      execute(config, mergeStatement, Map("rows" -> params).asJava, write = true)
+    })
+  }
+
+  def createLocalEdgeList(sc: SparkContext,
+                          dataFrame: DataFrame,
+                          source: (String, Seq[String]),
+                          relationship: (String, Seq[String]),
+                          target: (String, Seq[String]),
+                          renamedColumns: Map[String, String] = Map.empty, batchSize: Int = 1000,
+                          merge: Boolean = false, printCount: Int = 100000): Unit = {
+    val mergeOrCreate = if (merge) "MERGE" else "CREATE"
+
+    val sourceLabel: String = renamedColumns.getOrElse(source._2.head, source._2.head)
+    val targetLabel: String = renamedColumns.getOrElse(target._2.head, target._2.head)
+    val mergeStatement =
+      s"""
+        UNWIND {rows} as row
+        MATCH (source:`${source._1}` {`${sourceLabel}` : row.source.`${sourceLabel}`}),
+        (target:`${target._1}` {`${targetLabel}` : row.target.`${targetLabel}`})
+        ${mergeOrCreate} (source)-[rel:`${relationship._1}`]->(target) SET rel += row.relationship
+        """
+
+    println(s"=============mergeStatement: ${mergeStatement} batchSize: ${batchSize} printCount:${printCount}")
+    val config = Neo4jConfig(sc.getConf)
+
+    def printStat(total: Long, currentCount: Long, start: LocalDateTime, batchCount: Int, totalTime: Long): Unit = {
+      val seconds = Duration.between(start, LocalDateTime.now()).getSeconds
+      val percentage = (currentCount * 100.0 / total).formatted("%.4f");
+      val speed = (currentCount * 1.0 / seconds).formatted("%.2f");
+      val avgTime = (totalTime * 1.0 / (batchCount * 1000)).formatted("%.4f")
+      System.out.println(s"edges :${total} ->${currentCount} " +
+        s"--->(${percentage}%)---> ${speed} (row/second) ,time:${seconds} (s),avg:${avgTime} (s) ")
+    }
+
+    val rowCount = dataFrame.count()
+    dataFrame.cache()
+    val driver: Driver = config.driver()
+    val session = driver.session()
+
+    /**
+     * 执行逻辑
+     *
+     * @param rows
+     * @param write
+     */
+    def runInter(rows: Iterable[Row], write: Boolean = true): Long = {
+      val t1 = System.currentTimeMillis();
+      val params: AnyRef = rows.map(r =>
+        Map(
+          "source" -> source._2.map(c => (renamedColumns.getOrElse(c, c), r.getAs[AnyRef](c))).toMap.asJava,
+          "target" -> target._2.map(c => (renamedColumns.getOrElse(c, c), r.getAs[AnyRef](c))).toMap.asJava,
+          "relationship" -> relationship._2.map(c => (c, r.getAs[AnyRef](c))).toMap.asJava)
+          .asJava).asJava
+      val runner = new TransactionWork[ResultSummary]() {
+        override def execute(tx: Transaction): ResultSummary =
+          tx.run(mergeStatement, Map("rows" -> params).asJava).consume()
+      }
+      if (write) {
+        session.writeTransaction(runner)
+      }
+      else {
+        session.readTransaction(runner)
+      }
+      val total = System.currentTimeMillis() - t1
+      total
+    }
+
+    try {
+      var rows = new ArrayBuffer[Row]();
+      var count = 0;
+      val iter = dataFrame.toLocalIterator()
+      var currentTotal = 0
+      val start = LocalDateTime.now()
+      var batchCount = 0;
+      var executeTime = 0L;
+      while (iter.hasNext) {
+        rows += iter.next();
+        count += 1
+        currentTotal += 1
+        if (count % batchSize == 0) {
+          val time = runInter(rows)
+          batchCount += 1
+          executeTime += time
+          count = 0
+          rows.clear()
+        }
+        if (currentTotal % printCount == 0) {
+          printStat(rowCount, currentTotal, start, batchCount, executeTime)
+        }
+      }
+      if (count > 0) {
+        val time = runInter(rows)
+        batchCount += 1
+        executeTime += time
+        rows.clear()
+      }
+      printStat(rowCount, currentTotal, start, batchCount, executeTime)
+
+    } finally {
+      if (session.isOpen) session.close()
+      driver.close()
+    }
+
+  }
+
+
+  def createNodes(sc: SparkContext, dataFrame: DataFrame, nodes: (String, Seq[String]), renamedColumns: Map[String, String] = Map.empty, batchSize: Int = 10000, merge: Boolean = false): Unit = {
+
+    val nodeLabel: String = renamedColumns.getOrElse(nodes._2.head, nodes._2.head)
+    val mergeOrCreate = if (merge) "MERGE" else "CREATE"
+    val createStatement =
+      s"""
+        UNWIND {rows} as row
+        ${mergeOrCreate} (node:`${nodes._1}` {`${nodeLabel}` : row.source.`${nodeLabel}`})
+        SET node = row.node_properties
+        """
+    println(s"createStatement: ${createStatement}")
+
+    val partitions = Math.max(1, (dataFrame.count() / batchSize).asInstanceOf[Int])
+    val config = Neo4jConfig(sc.getConf)
+    dataFrame.repartition(partitions).foreachPartition(rows => {
+      val params: AnyRef = rows.map(r =>
+        Map(
+          "node_properties" -> nodes._2.map(c => (renamedColumns.getOrElse(c, c), r.getAs[AnyRef](c))).toMap.asJava)
           .asJava).asJava
       Neo4jDataFrame.execute(config, createStatement, Map("rows" -> params).asJava, write = true)
     })
   }
 
-  def execute(config : Neo4jConfig, query: String, parameters: java.util.Map[String, AnyRef], write: Boolean = false) : ResultSummary = {
+  def execute(config: Neo4jConfig, query: String, parameters: java.util.Map[String, AnyRef], write: Boolean = false): ResultSummary = {
     val driver: Driver = config.driver()
     val session = driver.session()
     try {
-      val runner =  new TransactionWork[ResultSummary]() { override def execute(tx:Transaction) : ResultSummary =
-         tx.run(query, parameters).consume()
+      val runner = new TransactionWork[ResultSummary]() {
+        override def execute(tx: Transaction): ResultSummary =
+          tx.run(query, parameters).consume()
       }
       if (write) {
         session.writeTransaction(runner)
@@ -89,21 +232,22 @@ object Neo4jDataFrame {
     sqlContext.createDataFrame(rowRdd, CypherTypes.schemaFromNamedType(schema))
   }
 
-  def apply(sqlContext: SQLContext, query: String, parameters: java.util.Map[String, AnyRef], write: Boolean = false) : DataFrame = {
+  def apply(sqlContext: SQLContext, query: String, parameters: java.util.Map[String, AnyRef], write: Boolean = false): DataFrame = {
     val config = Neo4jConfig(sqlContext.sparkContext.getConf)
     val driver: Driver = config.driver()
     val session = driver.session()
     try {
       val runTransaction = new TransactionWork[DataFrame]() {
-        override def execute(tx:Transaction) : DataFrame = {
-            val result = session.run(query, parameters)
-            if (!result.hasNext) throw new RuntimeException("Can't determine schema from empty result")
-            val peek: Record = result.peek()
-            val fields = peek.keys().asScala.map(k => (k, peek.get(k).`type`())).map(keyType => CypherTypes.field(keyType))
-            val schema = StructType(fields)
-            val rowRdd = new Neo4jResultRdd(sqlContext.sparkContext, result.asScala, peek.size(), session, driver)
-            sqlContext.createDataFrame(rowRdd, schema)
-      }}
+        override def execute(tx: Transaction): DataFrame = {
+          val result = session.run(query, parameters)
+          if (!result.hasNext) throw new RuntimeException("Can't determine schema from empty result")
+          val peek: Record = result.peek()
+          val fields = peek.keys().asScala.map(k => (k, peek.get(k).`type`())).map(keyType => CypherTypes.field(keyType))
+          val schema = StructType(fields)
+          val rowRdd = new Neo4jResultRdd(sqlContext.sparkContext, result.asScala, peek.size(), session, driver)
+          sqlContext.createDataFrame(rowRdd, schema)
+        }
+      }
       if (write)
         session.writeTransaction(runTransaction)
       else
@@ -115,39 +259,39 @@ object Neo4jDataFrame {
   }
 
 
-  class Neo4jResultRdd(@transient sc: SparkContext, result : Iterator[Record], keyCount : Int, session: Session, driver:Driver)
-  extends RDD[Row](sc, Nil) {
+  class Neo4jResultRdd(@transient sc: SparkContext, result: Iterator[Record], keyCount: Int, session: Session, driver: Driver)
+    extends RDD[Row](sc, Nil) {
 
     def convert(value: AnyRef) = value match {
-      case m: java.util.Map[_,_] => m.asScala
+      case m: java.util.Map[_, _] => m.asScala
       case _ => value
     }
 
-  override def compute(split: Partition, context: TaskContext): Iterator[Row] = {
-    result.map(record => {
-      val res = keyCount match {
-        case 0 => Row.empty
-        case 1 => Row(convert(record.get(0).asObject()))
-        case _ =>
-          val builder = Seq.newBuilder[AnyRef]
-          builder.sizeHint(keyCount)
-          var i = 0
-          while (i < keyCount) {
-            builder += convert(record.get(i).asObject())
-            i = i + 1
-          }
-          Row.fromSeq(builder.result())
-      }
-      if (!result.hasNext) {
-        session.close()
-        driver.close()
-      }
-      res
-    })
-  }
+    override def compute(split: Partition, context: TaskContext): Iterator[Row] = {
+      result.map(record => {
+        val res = keyCount match {
+          case 0 => Row.empty
+          case 1 => Row(convert(record.get(0).asObject()))
+          case _ =>
+            val builder = Seq.newBuilder[AnyRef]
+            builder.sizeHint(keyCount)
+            var i = 0
+            while (i < keyCount) {
+              builder += convert(record.get(i).asObject())
+              i = i + 1
+            }
+            Row.fromSeq(builder.result())
+        }
+        if (!result.hasNext) {
+          session.close()
+          driver.close()
+        }
+        res
+      })
+    }
 
-  override protected def getPartitions: Array[Partition] = Array(new Neo4jPartition())
-}
+    override protected def getPartitions: Array[Partition] = Array(new Neo4jPartition())
+  }
 
 }
 
@@ -160,7 +304,7 @@ object CypherTypes {
   val DATETIME = DataTypes.TimestampType
   val DATE = DataTypes.DateType
 
-  def typeOf(typ: String) : DataType = typ.toUpperCase match {
+  def typeOf(typ: String): DataType = typ.toUpperCase match {
     case "LONG" => INTEGER
     case "INT" => INTEGER
     case "INTEGER" => INTEGER
@@ -180,21 +324,22 @@ object CypherTypes {
     (typ.charAt(0), typ.substring(1, typ.length - 1), typ.charAt(typ.length - 1)) match {
       case ('[', inner, ']') => DataTypes.createArrayType(typeOf(inner), true)
       case ('{', inner, '}') => DataTypes.createMapType(STRING, typeOf(inner), true)
-      case _  => typeOf(typ)
+      case _ => typeOf(typ)
     }
 
-//  val MAP = edges.MapType(edges.StringType,edges.AnyDataType)
-//  val LIST = edges.ArrayType(edges.AnyDataType)
-// , MAP, LIST, NODE, RELATIONSHIP, PATH
+  //  val MAP = edges.MapType(edges.StringType,edges.AnyDataType)
+  //  val LIST = edges.ArrayType(edges.AnyDataType)
+  // , MAP, LIST, NODE, RELATIONSHIP, PATH
 
 
-  def toSparkType(typeSystem : TypeSystem, typ : Type): org.apache.spark.sql.types.DataType =
+  def toSparkType(typeSystem: TypeSystem, typ: Type): org.apache.spark.sql.types.DataType =
     if (typ == typeSystem.BOOLEAN()) CypherTypes.BOOLEAN
     else if (typ == typeSystem.STRING()) CypherTypes.STRING
     else if (typ == typeSystem.INTEGER()) CypherTypes.INTEGER
     else if (typ == typeSystem.FLOAT()) CypherTypes.FlOAT
     else if (typ == typeSystem.NULL()) CypherTypes.NULL
     else CypherTypes.STRING
+
   //    type match {
   //    case typeSystem.MAP => edges.MapType(edges.StringType,edges.ObjectType)
   //    case typeSystem.LIST => edges.ArrayType(edges.ObjectType, containsNull = false)
@@ -207,14 +352,16 @@ object CypherTypes {
   def field(keyType: (String, Type)): StructField = {
     StructField(keyType._1, CypherTypes.toSparkType(InternalTypeSystem.TYPE_SYSTEM, keyType._2))
   }
+
   def schemaFromNamedType(schemaInfo: Seq[(String, String)]) = {
     val fields = schemaInfo.map(field =>
-      StructField(field._1, CypherTypes(field._2), nullable = true) )
+      StructField(field._1, CypherTypes(field._2), nullable = true))
     StructType(fields)
   }
+
   def schemaFromDataType(schemaInfo: Seq[(String, DataType)]) = {
     val fields = schemaInfo.map(field =>
-      StructField(field._1, field._2, nullable = true) )
+      StructField(field._1, field._2, nullable = true))
     StructType(fields)
   }
 
