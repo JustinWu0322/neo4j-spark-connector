@@ -46,37 +46,6 @@ object Neo4jDataFrame {
   }
 
 
-  def createEdgeList(sc: SparkContext,
-                     dataFrame: DataFrame,
-                     source: (String, Seq[String]),
-                     relationship: (String, Seq[String]),
-                     target: (String, Seq[String]),
-                     renamedColumns: Map[String, String] = Map.empty, batchSize: Int = 1000): Unit = {
-
-    val sourceLabel: String = renamedColumns.getOrElse(source._2.head, source._2.head)
-    val targetLabel: String = renamedColumns.getOrElse(target._2.head, target._2.head)
-    val mergeStatement =
-      s"""
-        UNWIND {rows} as row
-        MATCH (source:`${source._1}` {`${sourceLabel}` : row.source.`${sourceLabel}`}),
-        (target:`${target._1}` {`${targetLabel}` : row.target.`${targetLabel}`})
-        create (source)-[rel:`${relationship._1}`]->(target) return count(rel)
-        """
-
-    println(s"=============mergeStatement: ${mergeStatement}")
-    val partitions = Math.max(1, (dataFrame.count() / batchSize).asInstanceOf[Int])
-    val config = Neo4jConfig(sc.getConf)
-    dataFrame.repartition(partitions).foreachPartition(rows => {
-      val params: AnyRef = rows.map(r =>
-        Map(
-          "source" -> source._2.map(c => (renamedColumns.getOrElse(c, c), r.getAs[AnyRef](c))).toMap.asJava,
-          "target" -> target._2.map(c => (renamedColumns.getOrElse(c, c), r.getAs[AnyRef](c))).toMap.asJava,
-          "relationship" -> relationship._2.map(c => (c, r.getAs[AnyRef](c))).toMap.asJava)
-          .asJava).asJava
-      execute(config, mergeStatement, Map("rows" -> params).asJava, write = true)
-    })
-  }
-
   def createLocalEdgeList(sc: SparkContext,
                           dataFrame: DataFrame,
                           source: (String, Seq[String]),
@@ -97,46 +66,44 @@ object Neo4jDataFrame {
         """
 
     println(s"=============mergeStatement: ${mergeStatement} batchSize: ${batchSize} printCount:${printCount}")
-    val config = Neo4jConfig(sc.getConf)
-
-    def printStat(total: Long, currentCount: Long, start: LocalDateTime, batchCount: Int, totalTime: Long): Unit = {
-      val seconds = Duration.between(start, LocalDateTime.now()).getSeconds
-      val percentage = (currentCount * 100.0 / total).formatted("%.4f");
-      val speed = (currentCount * 1.0 / seconds).formatted("%.2f");
-      val avgTime = (totalTime * 1.0 / (batchCount * 1000)).formatted("%.4f")
-      System.out.println(s"edges :${total} ->${currentCount} " +
-        s"--->(${percentage}%)---> ${speed} (row/second) ,time:${seconds} (s),avg:${avgTime} (s) ")
-    }
-
-    val rowCount = dataFrame.count()
-    dataFrame.cache()
-    val driver: Driver = config.driver()
-    val session = driver.session()
-
-    /**
-     * 执行逻辑
-     *
-     * @param rows
-     * @param write
-     */
-    def runInter(rows: Iterable[Row], write: Boolean = true): Long = {
-      val t1 = System.currentTimeMillis();
+    def genParams(rows: Iterator[Row]): java.util.Map[String, AnyRef] = {
       val params: AnyRef = rows.map(r =>
         Map(
           "source" -> source._2.map(c => (renamedColumns.getOrElse(c, c), r.getAs[AnyRef](c))).toMap.asJava,
           "target" -> target._2.map(c => (renamedColumns.getOrElse(c, c), r.getAs[AnyRef](c))).toMap.asJava,
           "relationship" -> relationship._2.map(c => (c, r.getAs[AnyRef](c))).toMap.asJava)
           .asJava).asJava
-      val runner = new TransactionWork[ResultSummary]() {
-        override def execute(tx: Transaction): ResultSummary =
-          tx.run(mergeStatement, Map("rows" -> params).asJava).consume()
-      }
-      if (write) {
-        session.writeTransaction(runner)
-      }
-      else {
-        session.readTransaction(runner)
-      }
+      Map("rows" -> params).asJava
+    }
+    createLocal(sc,dataFrame,mergeStatement,genParams:(Iterator[Row])=>java.util.Map[String, AnyRef] ,
+      batchSize=batchSize,printCount=printCount)
+  }
+
+
+  def createLocal(sc: SparkContext, dataFrame: DataFrame, cql: String, runInter: (Iterator[Row]) => java.util.Map[String, AnyRef],
+                  batchSize: Int = 1000, printCount: Int = 100000): Unit = {
+
+    val config = Neo4jConfig(sc.getConf)
+
+    val driver: Driver = config.driver()
+    val session = driver.session()
+
+    val rowCount = dataFrame.count()
+    dataFrame.cache()
+
+    def printStat(total: Long, currentCount: Long, start: LocalDateTime, batchCount: Int, totalTime: Long): Unit = {
+      val seconds = Duration.between(start, LocalDateTime.now()).getSeconds
+      val percentage = (currentCount * 100.0 / total).formatted("%.4f");
+      val speed = (currentCount * 1.0 / seconds).formatted("%.2f");
+      val avgTime = (totalTime * 1.0 / (batchCount * 1000)).formatted("%.4f")
+      System.out.println(s"total :${total} ->${currentCount} " +
+        s"--->(${percentage}%)---> ${speed} (row/second) ,time:${seconds} (s),avg:${avgTime} (s) ")
+    }
+
+    def run(rows: Iterator[Row], write: Boolean = true): Long = {
+      val t1 = System.currentTimeMillis();
+      val parameters = runInter(rows)
+      execute(config, cql, parameters, write)
       val total = System.currentTimeMillis() - t1
       total
     }
@@ -154,7 +121,7 @@ object Neo4jDataFrame {
         count += 1
         currentTotal += 1
         if (count % batchSize == 0) {
-          val time = runInter(rows)
+          val time = run(rows.toIterator)
           batchCount += 1
           executeTime += time
           count = 0
@@ -165,7 +132,7 @@ object Neo4jDataFrame {
         }
       }
       if (count > 0) {
-        val time = runInter(rows)
+        val time = run(rows.toIterator)
         batchCount += 1
         executeTime += time
         rows.clear()
@@ -179,8 +146,8 @@ object Neo4jDataFrame {
 
   }
 
-
-  def createNodes(sc: SparkContext, dataFrame: DataFrame, nodes: (String, Seq[String]), renamedColumns: Map[String, String] = Map.empty, batchSize: Int = 10000, merge: Boolean = false): Unit = {
+  def createNodes(sc: SparkContext, dataFrame: DataFrame, nodes: (String, Seq[String]), renamedColumns: Map[String, String] = Map.empty,
+                  batchSize: Int = 10000, printCount: Int = 100000, merge: Boolean = false): Unit = {
 
     val nodeLabel: String = renamedColumns.getOrElse(nodes._2.head, nodes._2.head)
     val mergeOrCreate = if (merge) "MERGE" else "CREATE"
@@ -192,17 +159,29 @@ object Neo4jDataFrame {
         """
     println(s"createStatement: ${createStatement}")
 
-    val partitions = Math.max(1, (dataFrame.count() / batchSize).asInstanceOf[Int])
-    val config = Neo4jConfig(sc.getConf)
-    dataFrame.repartition(partitions).foreachPartition(rows => {
+    def genParams(rows: Iterator[Row]): java.util.Map[String, AnyRef] = {
       val params: AnyRef = rows.map(r =>
         Map(
           "source" -> Map(nodeLabel -> r.getAs[AnyRef](nodeLabel)).asJava,
           "node_properties" -> nodes._2.map(c => (renamedColumns.getOrElse(c, c), r.getAs[AnyRef](c))).toMap.asJava)
           .asJava).asJava
-      Neo4jDataFrame.execute(config, createStatement, Map("rows" -> params).asJava, write = true)
-    })
+      Map("rows" -> params).asJava
+    }
+
+    if (!merge) {
+      val partitions = Math.max(1, (dataFrame.count() / batchSize).asInstanceOf[Int])
+      val config = Neo4jConfig(sc.getConf)
+      dataFrame.repartition(partitions).foreachPartition(rows => {
+        Neo4jDataFrame.execute(config, createStatement, genParams(rows), write = true)
+      })
+    } else {
+      createLocal(sc, dataFrame, createStatement, genParams: (Iterator[Row]) => java.util.Map[String, AnyRef],
+        batchSize = batchSize, printCount = printCount)
+    }
+
+
   }
+
 
   def execute(config: Neo4jConfig, query: String, parameters: java.util.Map[String, AnyRef], write: Boolean = false): ResultSummary = {
     val driver: Driver = config.driver()
